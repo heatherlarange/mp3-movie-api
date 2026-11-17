@@ -1,0 +1,16 @@
+# Python cache
+data/
+venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyc
+*.log
+# IDE
+.vscode/
+.idea/
+# OS
+.DS_Store
+Thumbs.db
+venv/
+output/

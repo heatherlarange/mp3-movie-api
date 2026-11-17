@@ -1,56 +1,105 @@
 import logging
+import sqlite3
+import pandas as pd
+from .database import get_connection, initialize_database
 
 logger = logging.getLogger(__name__)
 
-class DatasetStorage:
-    def __init__(self):
-        self._store = {}
-        self._counter = 0
+MOVIE_COLUMNS = ["title", "release_year", "rating", "genre"]
 
-    def save(self, df, filename):
-        """Store a copy of the data and return a new integer ID."""
-        self._counter += 1
-        dataset_id = self._counter
-        self._store[dataset_id] = {"filename": filename, "df": df.copy()}
-        logger.debug("Stored dataset: id=%d, rows=%d", dataset_id, len(df))
-        return dataset_id
+class MovieStorage:
+    def __init__(self, db_path="data/movies.db"):
+        self.db_path = db_path
+        initialize_database(self.db_path)
 
-    def get(self, dataset_id):
-        """Return a copy of the stored DataFrame, or None."""
-        entry = self._store.get(dataset_id)
-        if entry is None:
-            logger.debug("Dataset not in storage: id=%d", dataset_id)
-            return None
-        df = entry["df"].copy()
-        logger.debug("Retrieved dataset copy: id=%d, rows=%d", dataset_id, len(df))
-        return df
+    def save(self, df):
+        """Replace all movie rows in one transaction."""
+        # reindex: guarantees column order, and a column the cleaner dropped becomes NULL
+        subset = df.reindex(columns=MOVIE_COLUMNS)
+        clean = subset.astype(object).where(subset.notna(), None)
+        rows = clean.values.tolist()
 
-    def get_metadata(self, dataset_id):
-        """Return the dataset metadata, or None."""
-        """Return the dataset metadata, or None."""
-        entry = self._store.get(dataset_id)
-        if entry is None:
-            return None
-        df = entry["df"]
-        logger.debug("Retrieved metadata: id=%d", dataset_id)
-        return {
-            "id": dataset_id,
-            "filename": entry["filename"],
-            "rows": len(df),
-            "columns": len(df.columns),
-            "column_names": [str(c) for c in df.columns],
-        }
+        connection = get_connection(self.db_path)
+        try:
+            connection.execute("DELETE FROM movies")
+            connection.executemany(
+                "INSERT INTO movies (title, release_year, rating, genre) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            connection.commit()
+            logger.debug("Stored movies in SQLite: rows=%d", len(rows))
+        except sqlite3.Error as error:
+            connection.rollback()
+            logger.error("Failed to store movies: %s", error)
+            raise
+        finally:
+            connection.close()
 
-    def update(self, dataset_id, df):
-        """Replace an existing dataset; return True, or False if missing."""
-        if dataset_id not in self._store:
-            logger.debug("Update failed, dataset missing: id=%d", dataset_id)
-            return False
-        self._store[dataset_id]["df"] = df.copy()
-        logger.debug("Updated dataset: id=%d, rows=%d", dataset_id, len(df))
-        return True
+    def get(self):
+        """Return the four movie columns as a DataFrame, ordered by id."""
+        connection = get_connection(self.db_path)
+        try:
+            rows = connection.execute(
+                "SELECT title, release_year, rating, genre FROM movies ORDER BY id"
+            ).fetchall()
+            df = pd.DataFrame([tuple(row) for row in rows], columns=MOVIE_COLUMNS)
+            logger.debug("Retrieved movies: rows=%d", len(df))
+            return df
+        finally:
+            connection.close()
     
-    def clear(self):
-        """Clear all data and reset the ID counter."""
-        self._store.clear()
-        self._counter = 0
+    def select_columns(self, columns, limit=5):
+        """Return id plus the requested movie columns, ordered by id."""
+        if not columns:
+            logger.error("Select at least one column")
+            raise ValueError("Select at least one column")
+        
+        for column in columns:
+            if column not in MOVIE_COLUMNS:
+                logger.error(f"Unsupported column: {column}")
+                raise ValueError(f"Unsupported column: {column}")
+        
+        selected_columns = ", ".join(["id"] + columns)
+        connection = get_connection(self.db_path)
+        try:
+            rows = connection.execute(
+                f"SELECT {selected_columns} FROM movies ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            result = [dict(row) for row in rows]
+            logger.debug("Selected columns=%s, rows=%d", columns, len(result))
+            return result
+        finally:
+            connection.close()
+
+    def count_movies(self):
+        """Return the number of stored movies using SQL COUNT(*)."""
+        connection = get_connection(self.db_path)
+        try:
+            return connection.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
+        finally:
+            connection.close()
+
+    def query_movies(self, columns, min_rating, limit):
+        """Return selected fields from matching movies using SQL."""
+        if not columns:
+            logger.error("Select at least one column")
+            raise ValueError("Select at least one column")
+        for column in columns:
+            if column not in MOVIE_COLUMNS:
+                logger.error(f"Unsupported column: {column}")
+                raise ValueError(f"Unsupported column: {column}")
+
+        selected_columns = ", ".join(["id"] + columns)
+        connection = get_connection(self.db_path)
+        try:
+            rows = connection.execute(
+                f"SELECT {selected_columns} FROM movies "
+                "WHERE rating >= ? ORDER BY rating DESC, id ASC LIMIT ?",
+                (min_rating, limit),
+            ).fetchall()
+            result = [dict(row) for row in rows]
+            logger.debug("Queried columns=%s, rows=%d", columns, len(result))
+            return result
+        finally:
+            connection.close()
